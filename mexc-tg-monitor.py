@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""
-MEXC-Binance Spread Monitor v6 — anti-ban + исправленный API
-"""
+"""MEXC-Binance Spread Monitor v7 — curl_cffi (Cloudflare bypass)"""
+
 import asyncio, json, time, os, logging, hmac, hashlib, random
 from datetime import datetime, date
 from urllib.parse import urlencode
+from curl_cffi import requests as curl_requests
 
 for k in ['HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy','ALL_PROXY','all_proxy']:
     os.environ.pop(k, None)
@@ -44,16 +44,6 @@ TG_BOT_TOKEN = os.getenv("MEXC_TG_BOT_TOKEN", "8754024491:AAGgZ14zGGZFcLZ4cphcHZ
 TG_CHAT_ID = os.getenv("MEXC_TG_CHAT_ID", "1371329042")
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
 SIGNAL_FILE = "/tmp/mexc-tg-signals.txt"
-API_BASE = "https://api.mexc.com"
-
-# --- HTTP заголовки (анти-бан) ---
-_BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-    "Referer": "https://www.mexc.com/",
-    "Origin": "https://www.mexc.com",
-}
 
 # --- API ключи ---
 API_KEY = ""
@@ -69,8 +59,23 @@ except:
     API_SECRET = os.getenv("MEXC_API_SECRET", "")
 
 AUTO_MODE = bool(API_KEY and API_SECRET)
+
+# --- curl_cffi helper (имитируем curl, а не Python) ---
+def _curl(method, url, **kwargs):
+    """curl_cffi-запрос с impersonate chrome131"""
+    kwargs.setdefault('impersonate', 'chrome131')
+    kwargs.setdefault('timeout', 10)
+    kwargs.setdefault('verify', True)
+    # Force HTTP/2 if supported (curl_cffi handles)
+    try:
+        if method.upper() == 'GET':
+            return curl_requests.get(url, **kwargs)
+        else:
+            return curl_requests.post(url, **kwargs)
+    except Exception as e:
+        raise
+
 # --- Состояние ---
-import aiohttp
 binance_prices = {}
 mexc_prices = {}
 last_alert_ts = {}
@@ -87,21 +92,19 @@ _consecutive_losses = 0
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('monitor')
 
-# ========== MEXC API (v2 signature) ==========
+# ========== MEXC API (V1 signature) ==========
 
 def _param_string(method, params, body):
-    """Построить parameterString. Важно: стандартный json.dumps (с пробелами)"""
     if method == "GET":
         if params:
             return urlencode(sorted(params.items()))
         return ""
-    else:  # POST
+    else:
         if body:
             return json.dumps(body)
         return ""
 
 def _mexc_sig(method, params, body, ts):
-    """Подпись: HMAC-SHA256(api_key + ts + param_string, secret)"""
     ps = _param_string(method, params, body)
     raw = API_KEY + ts + ps
     return hmac.new(API_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
@@ -115,62 +118,42 @@ async def mexc_api(method, path, params=None, body=None):
         return None
     ts = str(int(time.time() * 1000))
     sig = _mexc_sig(method, params or {}, body or {}, ts)
-    # V1 futures API → contract.mexc.com, V3 spot → api.mexc.com
-    base = "https://contract.mexc.com" if path.startswith("/api/v1/private") else API_BASE
+    base = "https://contract.mexc.com" if path.startswith("/api/v1/private") else "https://api.mexc.com"
     url = f"{base}{path}"
-    headers = dict(_BROWSER_HEADERS)
-    headers.update(_mexc_headers(ts, sig))
+    headers = _mexc_headers(ts, sig)
     try:
-        async with aiohttp.ClientSession() as s:
-            if method == "GET":
-                if params:
-                    qs = urlencode(params)
-                    url += f"?{qs}"
-                async with s.get(url, headers=headers, timeout=5) as r:
-                    ct = r.headers.get("Content-Type", "")
-                    if "json" not in ct:
-                        txt = await r.text()
-                        log.error(f"⚠️ API ({path}): {r.status} {ct} — {txt[:200]}")
-                        return None
-                    return await r.json()
-            else:
-                async with s.post(url, json=body, headers=headers, timeout=5) as r:
-                    ct = r.headers.get("Content-Type", "")
-                    if "json" not in ct:
-                        txt = await r.text()
-                        log.error(f"⚠️ API ({path}): {r.status} {ct} — {txt[:200]}")
-                        return None
-                    return await r.json()
+        r = await asyncio.to_thread(_curl, method, url, headers=headers,
+                                    json=body if method != "GET" else None,
+                                    params=params if method == "GET" else None)
+        ct = r.headers.get("Content-Type", "")
+        if "json" not in ct:
+            log.error(f"⚠️ API ({path}): {r.status_code} {ct} — {r.text[:200]}")
+            return None
+        return r.json()
     except Exception as e:
         log.error(f"⚠️ API ({path}): {e}")
         return None
 
 async def mexc_set_leverage(sym_key):
     msym = PAIRS[sym_key]
-    # Для изолированной, one-way режим: symbol + openType + positionType + leverage
+    # v1 futures: symbol with underscore
+    msym_v1 = msym[:-4] + "_" + msym[-4:]
     r = await mexc_api("POST", "/api/v1/private/position/change_leverage",
-        body={"symbol": msym, "openType": 1, "positionType": 1, "leverage": TRADE_LEVERAGE})
+        body={"symbol": msym_v1, "openType": 1, "positionType": 1, "leverage": TRADE_LEVERAGE})
     if r and r.get("success"):
         log.info(f"⚙️ {msym} плечо {TRADE_LEVERAGE}x")
         return True
-    # Попробуем с positionType=2 или без него
-    r2 = await mexc_api("POST", "/api/v1/private/position/change_leverage",
-        body={"symbol": msym, "openType": 1, "positionType": 1, "leverage": TRADE_LEVERAGE})
-    log.warning(f"⚠️ {msym} leverage: {r2}")
+    log.warning(f"⚠️ {msym} leverage: {r}")
     return False
 
 async def mexc_place_order(sym_key, direction, qty):
     msym = PAIRS[sym_key]
-    order_side = 1 if direction == "LONG" else 3  # 1=open long, 3=open short
+    msym_v1 = msym[:-4] + "_" + msym[-4:]
+    order_side = 1 if direction == "LONG" else 3
     body = {
-        "symbol": msym,
-        "price": 0,          # 0 = market
-        "vol": qty,
-        "side": order_side,
-        "type": 1,            # 1 = market order
-        "openType": 1,        # 1 = isolated
-        "positionId": 0,
-        "externalOid": f"hermes_{int(time.time())}"
+        "symbol": msym_v1, "price": 0, "vol": qty,
+        "side": order_side, "type": 1, "openType": 1,
+        "positionId": 0, "externalOid": f"hermes_{int(time.time())}"
     }
     r = await mexc_api("POST", "/api/v1/private/order/create", body=body)
     if r and r.get("success"):
@@ -182,7 +165,6 @@ async def mexc_place_order(sym_key, direction, qty):
 
 async def mexc_close_position(sym_key):
     msym = PAIRS[sym_key]
-    # Close all positions for this symbol
     r = await mexc_api("POST", "/api/v1/private/position/close_all", body={})
     if r and r.get("success"):
         log.info(f"📉 {msym} закрыто")
@@ -195,22 +177,25 @@ async def mexc_get_qty(sym_key):
     jitter = random.uniform(-TRADE_AMOUNT_JITTER, TRADE_AMOUNT_JITTER)
     amount = max(TRADE_AMOUNT_BASE + jitter, 5)
     msym = PAIRS[sym_key]
-    # MEXC v1 futures API переехал на contract.mexc.com, символ SOL_USDT
-    msym_v1 = msym[:-4] + "_" + msym[-4:] if "_" not in msym else msym
-    async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as s:
-        async with s.get(f"https://contract.mexc.com/api/v1/contract/detail?symbol={msym_v1}", timeout=5) as resp:
-            if resp.status != 200:
-                log.warning(f"⚠️ contract/detail {msym_v1}: {resp.status}")
-                return 1
-            d = await resp.json()
-            if d.get("success") and d.get("data"):
-                cs = float(d["data"]["contractSize"])
-                price = mexc_prices.get(sym_key, {}).get("ask", 0) or mexc_prices.get(sym_key, {}).get("bid", 0)
-                if price and cs and price > 0:
-                    qty = int((amount * TRADE_LEVERAGE) / (price * cs))
-                    qty = max(qty, 1)
-                    log.info(f"  {msym} qty={qty} (${amount}x{TRADE_LEVERAGE}x / ${price}x{cs})")
-                    return qty
+    msym_v1 = msym[:-4] + "_" + msym[-4:]
+    try:
+        # curl_cffi bypasses Cloudflare
+        r = await asyncio.to_thread(_curl, "GET",
+            f"https://contract.mexc.com/api/v1/contract/detail?symbol={msym_v1}")
+        if r.status_code != 200:
+            log.warning(f"⚠️ contract/detail {msym_v1}: {r.status_code}")
+            return 1
+        d = r.json()
+        if d.get("success") and d.get("data"):
+            cs = float(d["data"]["contractSize"])
+            price = mexc_prices.get(sym_key, {}).get("ask", 0) or mexc_prices.get(sym_key, {}).get("bid", 0)
+            if price and cs and price > 0:
+                qty = int((amount * TRADE_LEVERAGE) / (price * cs))
+                qty = max(qty, 1)
+                log.info(f"  {msym} qty={qty} (${amount}×{TRADE_LEVERAGE}x / ${price}×{cs})")
+                return qty
+    except Exception as e:
+        log.warning(f"⚠️ contract/detail {msym_v1}: {e}")
     return 1
 
 # ========== Risk Control ==========
@@ -287,32 +272,46 @@ def fmt_exit(sym, entry_sp, entry_dr, entry_bm, entry_mm, cur_bm, cur_mm, auto=F
 
 async def send_tg(text):
     try:
-        async with aiohttp.ClientSession() as s:
+        from aiohttp import ClientSession
+        async with ClientSession() as s:
             async with s.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", json={
                 "chat_id": TG_CHAT_ID, "text": text,
                 "parse_mode": "Markdown", "disable_web_page_preview": True
             }, timeout=10) as r:
                 if r.status != 200:
                     log.error(f"TG: {(await r.text())[:200]}")
+    except ImportError:
+        import requests as sync_req
+        try:
+            sync_req.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", json={
+                "chat_id": TG_CHAT_ID, "text": text,
+                "parse_mode": "Markdown", "disable_web_page_preview": True
+            }, timeout=10)
+        except Exception as e:
+            log.error(f"TG send: {e}")
     except Exception as e:
         log.error(f"TG send: {e}")
 
 # ========== Фильтр ==========
 
-async def check_liquidity(sym_key, direction, session):
+async def check_liquidity(sym_key, direction):
     try:
         msym = PAIRS[sym_key]
-        async with session.get(f"https://api.mexc.com/api/v3/depth?symbol={msym}&limit=20",
-                               headers=_BROWSER_HEADERS, timeout=5) as resp:
-            if resp.status != 200: return False, f"depth {resp.status}"
-            data = await resp.json()
+        r = await asyncio.to_thread(_curl, "GET",
+            f"https://api.mexc.com/api/v3/depth?symbol={msym}&limit=20")
+        if r.status_code != 200:
+            return False, f"depth {r.status_code}"
+        data = r.json()
         bids = [(float(p), float(q)) for p, q in data.get('bids', [])]
         asks = [(float(p), float(q)) for p, q in data.get('asks', [])]
-        if not bids or not asks: return False, "empty book"
+        if not bids or not asks:
+            return False, "empty book"
         mxc_sp = (asks[0][0] - bids[0][0]) / asks[0][0] * 100
-        if mxc_sp > MAX_MEXC_SPREAD: return False, f"spread {mxc_sp:.3f}%"
+        if mxc_sp > MAX_MEXC_SPREAD:
+            return False, f"spread {mxc_sp:.3f}%"
         cum_liq = sum(q * p for p, q in asks) if direction == "LONG" else sum(q * p for p, q in bids)
-        if cum_liq < MIN_LIQUIDITY: return False, f"liq ${cum_liq:.0f}"
+        if cum_liq < MIN_LIQUIDITY:
+            return False, f"liq ${cum_liq:.0f}"
         return True, f"✅ liq=${cum_liq:.0f} spread={mxc_sp:.3f}%"
     except Exception as e:
         return False, str(e)
@@ -336,136 +335,133 @@ async def binance_stream():
             await asyncio.sleep(3)
 
 async def mexc_poller():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                tasks = []
-                for key, msym in PAIRS.items():
-                    tasks.append(asyncio.create_task(
-                        session.get(f"https://api.mexc.com/api/v3/ticker/bookTicker?symbol={msym}",
-                                    headers=_BROWSER_HEADERS, timeout=5)
-                    ))
-                responses = await asyncio.gather(*tasks, return_exceptions=True)
-                for key, resp in zip(PAIRS.keys(), responses):
-                    if isinstance(resp, Exception): continue
-                    if resp.status == 200:
-                        d = await resp.json()
-                        mexc_prices[key] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
-            except Exception as e:
-                log.error(f"⚠️ MEXC: {e}")
-            await asyncio.sleep(1)
+    while True:
+        try:
+            tasks = []
+            for key, msym in PAIRS.items():
+                tasks.append(asyncio.to_thread(_curl, "GET",
+                    f"https://api.mexc.com/api/v3/ticker/bookTicker?symbol={msym}"))
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for key, resp in zip(PAIRS.keys(), responses):
+                if isinstance(resp, Exception):
+                    continue
+                if resp.status_code == 200:
+                    d = resp.json()
+                    mexc_prices[key] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
+        except Exception as e:
+            log.error(f"⚠️ MEXC: {e}")
+        await asyncio.sleep(1)
 
 # ========== Ядро ==========
 
 async def check_signals():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            await asyncio.sleep(0.3)
-            now = time.time()
+    while True:
+        await asyncio.sleep(0.3)
+        now = time.time()
 
-            # --- Выход ---
-            expired = []
-            for sym, trade in active_trades.items():
-                bp = binance_prices.get(sym)
-                mp = mexc_prices.get(sym)
-                if not bp or not mp: continue
-                bm = (bp["bid"] + bp["ask"]) / 2
-                mm = (mp["bid"] + mp["ask"]) / 2
-                if bm == 0: continue
-                cur_sp = (mm - bm) / bm * 100
-                cur_absp = abs(cur_sp)
+        # --- Выход ---
+        expired = []
+        for sym, trade in active_trades.items():
+            bp = binance_prices.get(sym)
+            mp = mexc_prices.get(sym)
+            if not bp or not mp: continue
+            bm = (bp["bid"] + bp["ask"]) / 2
+            mm = (mp["bid"] + mp["ask"]) / 2
+            if bm == 0: continue
+            cur_sp = (mm - bm) / bm * 100
+            cur_absp = abs(cur_sp)
 
-                if cur_absp < EXIT_SPREAD:
-                    if sym not in exit_alert_ts or now - exit_alert_ts[sym] >= 30:
-                        exit_alert_ts[sym] = now
-                        if AUTO_MODE and trade.get('order_placed'):
-                            await mexc_close_position(sym)
-                        pnl_usd = trade['entry_sp'] * TRADE_LEVERAGE / 100 * TRADE_AMOUNT_BASE
-                        record_trade(pnl_usd)
-                        _check_daily()
-                        exit_msg = fmt_exit(sym.upper(), trade['entry_sp'],
-                            trade['direction'], trade['entry_bm'], trade['entry_mm'],
-                            bm, mm, auto=AUTO_MODE)
-                        exit_msg += f"\n📊 День: {_trade_count_today}/{MAX_TRADES_PER_DAY} | ${_daily_pnl:+.2f}"
-                        log.info(f"🚪 {sym.upper()} — выход")
-                        print(f"\n{exit_msg}\n", flush=True)
-                        await send_tg(exit_msg)
-                    expired.append(sym)
-                elif now - trade['entry_time'] > EXIT_TIMEOUT:
-                    log.info(f"⌛ {sym.upper()} — таймаут")
+            if cur_absp < EXIT_SPREAD:
+                if sym not in exit_alert_ts or now - exit_alert_ts[sym] >= 30:
+                    exit_alert_ts[sym] = now
                     if AUTO_MODE and trade.get('order_placed'):
                         await mexc_close_position(sym)
-                    expired.append(sym)
-            for sym in expired:
-                active_trades.pop(sym, None)
+                    pnl_usd = trade['entry_sp'] * TRADE_LEVERAGE / 100 * TRADE_AMOUNT_BASE
+                    record_trade(pnl_usd)
+                    _check_daily()
+                    exit_msg = fmt_exit(sym.upper(), trade['entry_sp'],
+                        trade['direction'], trade['entry_bm'], trade['entry_mm'],
+                        bm, mm, auto=AUTO_MODE)
+                    exit_msg += f"\n📊 День: {_trade_count_today}/{MAX_TRADES_PER_DAY} | ${_daily_pnl:+.2f}"
+                    log.info(f"🚪 {sym.upper()} — выход")
+                    print(f"\n{exit_msg}\n", flush=True)
+                    await send_tg(exit_msg)
+                expired.append(sym)
+            elif now - trade['entry_time'] > EXIT_TIMEOUT:
+                log.info(f"⌛ {sym.upper()} — таймаут")
+                if AUTO_MODE and trade.get('order_placed'):
+                    await mexc_close_position(sym)
+                expired.append(sym)
+        for sym in expired:
+            active_trades.pop(sym, None)
 
-            # --- Вход ---
-            for sym in PAIRS:
-                bp = binance_prices.get(sym)
-                mp = mexc_prices.get(sym)
-                if not bp or not mp: continue
-                bm = (bp["bid"] + bp["ask"]) / 2
-                mm = (mp["bid"] + mp["ask"]) / 2
-                if bm == 0: continue
-                sp = (mm - bm) / bm * 100
-                absp = abs(sp)
-                if sym in active_trades: continue
+        # --- Вход ---
+        for sym in PAIRS:
+            bp = binance_prices.get(sym)
+            mp = mexc_prices.get(sym)
+            if not bp or not mp: continue
+            bm = (bp["bid"] + bp["ask"]) / 2
+            mm = (mp["bid"] + mp["ask"]) / 2
+            if bm == 0: continue
+            sp = (mm - bm) / bm * 100
+            absp = abs(sp)
+            if sym in active_trades: continue
 
-                if absp >= ENTRY_SPREAD:
-                    last = last_alert_ts.get(sym, 0)
-                    if now - last >= ALERT_CD:
-                        last_alert_ts[sym] = now
-                        dr = "SHORT" if mm > bm else "LONG"
+            if absp >= ENTRY_SPREAD:
+                last = last_alert_ts.get(sym, 0)
+                if now - last >= ALERT_CD:
+                    last_alert_ts[sym] = now
+                    dr = "SHORT" if mm > bm else "LONG"
 
-                        valid, reason = await check_liquidity(sym, dr, session)
-                        if not valid:
-                            log.info(f"⏭ {sym.upper()} {absp:.2f}% {dr} — {reason}")
-                            continue
+                    valid, reason = await check_liquidity(sym, dr)
+                    if not valid:
+                        log.info(f"⏭ {sym.upper()} {absp:.2f}% {dr} — {reason}")
+                        continue
 
-                        rc_ok, rc_reason = risk_check()
-                        if not rc_ok:
-                            log.info(f"⏭ {sym.upper()} {absp:.2f}% {dr} — RC: {rc_reason}")
-                            continue
+                    rc_ok, rc_reason = risk_check()
+                    if not rc_ok:
+                        log.info(f"⏭ {sym.upper()} {absp:.2f}% {dr} — RC: {rc_reason}")
+                        continue
 
-                        jitter = random.uniform(-TRADE_AMOUNT_JITTER, TRADE_AMOUNT_JITTER)
-                        amount = max(round(TRADE_AMOUNT_BASE + jitter, 1), 5.0)
+                    jitter = random.uniform(-TRADE_AMOUNT_JITTER, TRADE_AMOUNT_JITTER)
+                    amount = max(round(TRADE_AMOUNT_BASE + jitter, 1), 5.0)
 
-                        order_placed = False
-                        if AUTO_MODE and absp >= TG_THRESHOLD:
-                            delay = random.uniform(MIN_DELAY_OPEN, MAX_DELAY_OPEN)
-                            log.info(f"⏳ {sym.upper()} задержка {delay:.1f}s")
-                            await asyncio.sleep(delay)
-                            await mexc_set_leverage(sym)
-                            qty = await mexc_get_qty(sym)
-                            order = await mexc_place_order(sym, dr, qty)
-                            if order:
-                                order_placed = True
+                    order_placed = False
+                    if AUTO_MODE and absp >= TG_THRESHOLD:
+                        delay = random.uniform(MIN_DELAY_OPEN, MAX_DELAY_OPEN)
+                        log.info(f"⏳ {sym.upper()} задержка {delay:.1f}s")
+                        await asyncio.sleep(delay)
+                        await mexc_set_leverage(sym)
+                        qty = await mexc_get_qty(sym)
+                        order = await mexc_place_order(sym, dr, qty)
+                        if order:
+                            order_placed = True
 
-                        msg = fmt_entry(sym.upper(), sp, dr, bm, mm, auto=order_placed, amount=amount)
-                        mode_str = 'AUTO' if order_placed else 'SIGNAL'
-                        with open(SIGNAL_FILE, "a") as f:
-                            f.write(json.dumps({"t": now, "sym": sym.upper(), "msg": msg}) + "\n")
-                        with open("/tmp/mexc-spread-alerts.log", "a") as f:
-                            f.write(f"{datetime.now().isoformat()} | {sym.upper()} | {absp:.3f}% | {dr} | {mode_str} | ${amount:.0f} | {reason}\n")
-                        log.info(f"{'🤖' if order_placed else '🚨'} {sym.upper()} {absp:.2f}% {dr} ${amount:.0f}")
-                        print(f"\n{msg}\n", flush=True)
+                    msg = fmt_entry(sym.upper(), sp, dr, bm, mm, auto=order_placed, amount=amount)
+                    mode_str = 'AUTO' if order_placed else 'SIGNAL'
+                    with open(SIGNAL_FILE, "a") as f:
+                        f.write(json.dumps({"t": now, "sym": sym.upper(), "msg": msg}) + "\n")
+                    with open("/tmp/mexc-spread-alerts.log", "a") as f:
+                        f.write(f"{datetime.now().isoformat()} | {sym.upper()} | {absp:.3f}% | {dr} | {mode_str} | ${amount:.0f} | {reason}\n")
+                    log.info(f"{'🤖' if order_placed else '🚨'} {sym.upper()} {absp:.2f}% {dr} ${amount:.0f}")
+                    print(f"\n{msg}\n", flush=True)
 
-                        if absp >= TG_THRESHOLD:
-                            await send_tg(msg)
-                            active_trades[sym] = {
-                                'entry_time': now, 'entry_sp': absp,
-                                'direction': dr, 'entry_bm': bm, 'entry_mm': mm,
-                                'order_placed': order_placed, 'amount': amount
-                            }
+                    if absp >= TG_THRESHOLD:
+                        await send_tg(msg)
+                        active_trades[sym] = {
+                            'entry_time': now, 'entry_sp': absp,
+                            'direction': dr, 'entry_bm': bm, 'entry_mm': mm,
+                            'order_placed': order_placed, 'amount': amount
+                        }
 
 async def main():
     _check_daily()
-    log.info("🚀 MEXC-Binance Monitor v6")
+    log.info("🚀 MEXC-Binance Monitor v7 (curl_cffi)")
     log.info(f"Пары: {', '.join(PAIRS)} | Вход ≥{ENTRY_SPREAD}% | TG ≥{TG_THRESHOLD}%")
     log.info(f"Фильтры: спред ≤{MAX_MEXC_SPREAD}% | ликв. ≥${MIN_LIQUIDITY}")
     log.info(f"Параметры: ${TRADE_AMOUNT_BASE}±${TRADE_AMOUNT_JITTER} × {TRADE_LEVERAGE}x")
     log.info(f"RC: {MAX_CONCURRENT_TRADES} одн. | {MAX_TRADES_PER_DAY}/день | loss ${DAILY_LOSS_LIMIT}")
-    log.info(f"Anti-ban: задержка {MIN_DELAY_OPEN}-{MAX_DELAY_OPEN}s | пауза после {SERIES_PAUSE_AFTER}")
+    log.info(f"Anti-ban: curl_cffi (Cloudflare bypass) | задержка {MIN_DELAY_OPEN}-{MAX_DELAY_OPEN}s")
     if AUTO_MODE:
         log.info("🔥 РЕЖИМ: АВТО-ТРЕЙДИНГ")
     else:
