@@ -62,7 +62,7 @@ SLIPPAGE_BUFFER_PCT = float(os.getenv("MEXC_SLIPPAGE_BUFFER_PCT", "0.01"))
 MIN_NET_EDGE_PCT = float(os.getenv("MEXC_MIN_NET_EDGE_PCT", "0.04"))
 
 # Limit order config
-LIMIT_POST_ONLY_TYPE = int(os.getenv("MEXC_LIMIT_POST_ONLY_TYPE", "5"))
+LIMIT_POST_ONLY_TYPE = int(os.getenv("MEXC_LIMIT_POST_ONLY_TYPE", "2"))
 ENTRY_LIMIT_OFFSET_BPS = float(os.getenv("MEXC_ENTRY_LIMIT_OFFSET_BPS", "0.5"))
 ORDER_FILL_TIMEOUT_SEC = float(os.getenv("MEXC_ORDER_FILL_TIMEOUT_SEC", "2.0"))
 MEXC_WS_STALE_SEC = float(os.getenv("MEXC_WS_STALE_SEC", "5"))
@@ -392,17 +392,38 @@ async def mexc_order_status(sym_key_val, order_id):
     msym = PAIRS[sym_key_val]
     r = await mexc_api("GET", f"/api/v1/private/order/get/{order_id}")
     if r and r.get("success"):
-        return r.get("data")
+        data = r.get("data")
+        if data:
+            return {
+                "state": data.get("state"),        # 3=completed, 4=cancelled
+                "dealVol": float(data.get("dealVol", 0)),
+                "dealAvgPrice": float(data.get("dealAvgPrice", 0)),
+                "price": float(data.get("price", 0)),
+                "vol": float(data.get("vol", 0)),
+            }
     log.warning(f"⚠️ order status {order_id}: {r}")
     return None
 
-async def mexc_close_position(sym_key_val):
+async def mexc_close_position(sym_key_val, direction=None):
+    """Close position for specific symbol. Uses explicit close order (side 4=close long, 2=close short)."""
     msym = PAIRS[sym_key_val]
+    msym_v1 = to_mexc_contract_symbol(msym)
+    # Use close order if direction known
+    if direction:
+        close_side = 4 if direction == "LONG" else 2  # 4=close long, 2=close short
+        body = {"symbol": msym_v1, "price": 0, "vol": 0, "side": close_side, "type": 1, "openType": 1,
+                "positionId": 0, "externalOid": f"hermes_close_{int(time.time())}"}
+        r = await mexc_api("POST", "/api/v1/private/order/create", body=body)
+        if r and r.get("success"):
+            log.info(f"📉 {msym} закрыто (close order)")
+            return True
+        log.warning(f"⚠️ {msym} close order: {r}")
+    # Fallback: close_all (only as last resort)
     r = await mexc_api("POST", "/api/v1/private/position/close_all", body={})
     if r and r.get("success"):
-        log.info(f"📉 {msym} закрыто")
+        log.info(f"📉 {msym} close_all (fallback)")
         return True
-    log.warning(f"⚠️ {msym} close: {r}")
+    log.warning(f"⚠️ {msym} close_all: {r}")
     return False
 
 async def mexc_get_open_positions():
@@ -626,16 +647,18 @@ async def check_liquidity(sym_key_val, direction):
 
 async def binance_stream():
     streams = [f"{p}@bookTicker" for p in PAIRS]
-    url = f"{BINANCE_WS}/{'/'.join(streams)}"
+    url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                log.info(f"✅ Binance WS ({len(streams)} pairs)")
+                log.info(f"✅ Binance stream ({len(streams)} pairs)")
                 async for msg in ws:
                     d = json.loads(msg)
-                    s = d["s"].lower()
+                    # Combined stream wraps data
+                    data = d.get("data", d)
+                    s = data["s"].lower()
                     if s in PAIRS:
-                        binance_prices[s] = {"bid": float(d["b"]), "ask": float(d["a"])}
+                        binance_prices[s] = {"bid": float(data["b"]), "ask": float(data["a"]), "ts": time.time()}
         except Exception as e:
             log.error(f"⚠️ WS: {e}")
             await asyncio.sleep(3)
@@ -749,6 +772,16 @@ async def check_signals():
         await asyncio.sleep(0.3)
         now = time.time()
 
+        # --- Stale data check ---
+        STALE_SEC = 3.0
+        for sym in list(active_trades.keys()) + list(PAIRS.keys()):
+            bp = binance_prices.get(sym)
+            mp = mexc_prices.get(sym)
+            if bp and now - bp.get("ts", 0) > STALE_SEC:
+                binance_prices.pop(sym, None)
+            if mp and now - mp.get("ts", 0) > MEXC_WS_STALE_SEC:
+                mexc_prices.pop(sym, None)
+
         # --- Exit ---
         expired = []
         for sym, trade in active_trades.items():
@@ -765,7 +798,7 @@ async def check_signals():
                 if sym not in exit_alert_ts or now - exit_alert_ts[sym] >= 30:
                     exit_alert_ts[sym] = now
                     if AUTO_MODE and trade.get('order_placed'):
-                        await mexc_close_position(sym)
+                        await mexc_close_position(sym, trade.get('direction'))
                         db_exec("UPDATE trades SET closed_at=?,status='closed',close_reason=?,exit_price=?,binance_exit_ref=? "
                                 "WHERE status='open' AND symbol=? ORDER BY id DESC LIMIT 1",
                                 (datetime.utcnow().isoformat(), "spread_closed", mm, bm, sym.upper()))
@@ -783,7 +816,7 @@ async def check_signals():
             elif now - trade['entry_time'] > EXIT_TIMEOUT:
                 log.info(f"⌛ {sym.upper()} — таймаут")
                 if AUTO_MODE and trade.get('order_placed'):
-                    await mexc_close_position(sym)
+                    await mexc_close_position(sym, trade.get('direction'))
                     db_exec("UPDATE trades SET closed_at=?,status='closed',close_reason=? "
                             "WHERE status='open' AND symbol=? ORDER BY id DESC LIMIT 1",
                             (datetime.utcnow().isoformat(), "timeout", sym.upper()))
@@ -866,8 +899,9 @@ async def check_signals():
                                 if status is None:
                                     log.warning(f"  {sym} fill check: API error")
                                     break
-                                if status.get("status") == 2:  # filled
-                                    fill_price = float(status.get("price", edge["mexc_passive_price"]))
+                                state = status.get("state", 0)
+                                if state == 3:  # completed (filled)
+                                    fill_price = float(status.get("dealAvgPrice", 0) or status.get("price", edge["mexc_passive_price"]))
                                     log.info(f"  ✅ {sym} LIMIT filled @{fill_price}")
                                     db_insert_order(sig_id, sym.upper(), direction, oid, ext_oid,
                                                     1 if direction == "LONG" else 3, LIMIT_POST_ONLY_TYPE,
@@ -875,13 +909,15 @@ async def check_signals():
                                     order_placed = True
                                     filled = True
                                     break
-                                elif status.get("status") in (3, 4):  # cancelled / partial
-                                    log.warning(f"  {sym} LIMIT status={status.get('status')}")
+                                elif state == 4:  # cancelled
+                                    log.warning(f"  {sym} LIMIT cancelled (state=4)")
                                     break
-                                elif status.get("status") == 1:  # pending
+                                elif state == 2:  # uncompleted (pending, working)
+                                    pass
+                                elif state == 1:  # uninformed / new
                                     pass
                                 else:
-                                    log.warning(f"  {sym} LIMIT unknown status: {status}")
+                                    log.warning(f"  {sym} LIMIT unknown state={state}: {status}")
                                     break
 
                             if not filled:
