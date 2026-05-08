@@ -7,7 +7,10 @@ from urllib.parse import urlencode
 from curl_cffi import requests as curl_requests
 from pathlib import Path
 
-for k in ['HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy','ALL_PROXY','all_proxy']:
+# Сохраняем прокси ДО очистки (MEXC WS требует прокси, без него 403)
+_WS_PROXY = os.environ.get("ALL_PROXY", "") or os.environ.get("all_proxy", "")
+
+for k in ['HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy']:
     os.environ.pop(k, None)
 
 try:
@@ -62,6 +65,7 @@ MIN_NET_EDGE_PCT = float(os.getenv("MEXC_MIN_NET_EDGE_PCT", "0.04"))
 LIMIT_POST_ONLY_TYPE = int(os.getenv("MEXC_LIMIT_POST_ONLY_TYPE", "5"))
 ENTRY_LIMIT_OFFSET_BPS = float(os.getenv("MEXC_ENTRY_LIMIT_OFFSET_BPS", "0.5"))
 ORDER_FILL_TIMEOUT_SEC = float(os.getenv("MEXC_ORDER_FILL_TIMEOUT_SEC", "2.0"))
+MEXC_WS_STALE_SEC = float(os.getenv("MEXC_WS_STALE_SEC", "5"))
 
 TRADING_PAUSED_REASON = ""
 CLOSE_UNKNOWN_ON_STARTUP = os.getenv("MEXC_CLOSE_UNKNOWN_ON_STARTUP", "0") == "1"
@@ -636,24 +640,80 @@ async def binance_stream():
             log.error(f"⚠️ WS: {e}")
             await asyncio.sleep(3)
 
-async def mexc_poller():
+async def mexc_ws_stream():
+    """MEXC WebSocket — primary market data feed."""
+    log.info("🔌 MEXC WS connecting...")
     while True:
         try:
+            # MEXC WS требует прокси (NO_PROXY=* блокирует системный прокси)
+            if _WS_PROXY:
+                os.environ["HTTP_PROXY"] = _WS_PROXY
+                os.environ["HTTPS_PROXY"] = _WS_PROXY
+                os.environ["ALL_PROXY"] = _WS_PROXY
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+            async with websockets.connect("wss://contract.mexc.com/edge", ping_interval=20) as ws:
+                log.info("✅ MEXC WS connected")
+                # Subscribe to all active pairs
+                for key in PAIRS:
+                    msym_v1 = to_mexc_contract_symbol(PAIRS[key])
+                    sub = {"method": "sub.ticker", "param": {"symbol": msym_v1}}
+                    await ws.send(json.dumps(sub))
+                log.info(f"  Subscribed to {len(PAIRS)} pairs")
+                async for msg in ws:
+                    d = json.loads(msg)
+                    # Skip subscription confirmation
+                    if "channel" in d and d.get("channel") == "rs.sub.ticker":
+                        continue
+                    sym_data = d.get("data", {})
+                    symbol_raw = d.get("symbol", "")
+                    if symbol_raw and sym_data.get("bid1") is not None and sym_data.get("ask1") is not None:
+                        key = symbol_raw.replace("_", "").lower()
+                        if key in PAIRS:
+                            mexc_prices[key] = {
+                                "bid": float(sym_data["bid1"]),
+                                "ask": float(sym_data["ask1"]),
+                                "source": "ws",
+                                "ts": time.time(),
+                            }
+        except Exception as e:
+            log.error(f"⚠️ MEXC WS: {e}")
+            await asyncio.sleep(3)
+
+async def mexc_rest_fallback():
+    """REST fallback — only for stale or unsubscribed symbols."""
+    if not MEXC_REST_FALLBACK_ENABLED:
+        return
+    while True:
+        try:
+            stale_keys = [k for k in PAIRS
+                          if k not in mexc_prices
+                          or mexc_prices[k].get("source") == "rest"
+                          or (time.time() - mexc_prices[k].get("ts", 0) > MEXC_WS_STALE_SEC)]
+            if not stale_keys:
+                await asyncio.sleep(5)
+                continue
             tasks = []
-            for key, msym in PAIRS.items():
+            for key in stale_keys:
+                msym = PAIRS[key]
                 tasks.append(asyncio.to_thread(_curl, "GET",
                     f"https://api.mexc.com/api/v3/ticker/bookTicker?symbol={msym}"))
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for key, resp in zip(PAIRS.keys(), responses):
+            for key, resp in zip(stale_keys, responses):
                 if isinstance(resp, Exception):
                     continue
                 if resp.status_code == 200:
                     d = parse_json_response(resp, f"bookTicker {key}")
                     if d:
-                        mexc_prices[key] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
+                        mexc_prices[key] = {
+                            "bid": float(d["bidPrice"]),
+                            "ask": float(d["askPrice"]),
+                            "source": "rest",
+                            "ts": time.time(),
+                        }
         except Exception as e:
-            log.error(f"⚠️ MEXC: {e}")
-        await asyncio.sleep(1)
+            log.error(f"⚠️ MEXC fallback: {e}")
+        await asyncio.sleep(2)
 
 # ========== Heartbeat (P0.7) ==========
 
@@ -878,6 +938,7 @@ async def main():
     log.info(f"Fees: maker={MEXC_MAKER_FEE_PCT}% taker={MEXC_TAKER_FEE_PCT}% slippage={SLIPPAGE_BUFFER_PCT}%")
     log.info(f"Anti-ban: curl_cffi | задержка {MIN_DELAY_OPEN}-{MAX_DELAY_OPEN}s")
     log.info(f"Gates: dry_run={DRY_RUN} auto_trade={AUTO_TRADE_ENABLED} signal_only={SIGNAL_ONLY}")
+    log.info(f"MEXC data: WS={'✅' if MEXC_WS_ENABLED else '❌'} REST_fallback={'✅' if MEXC_REST_FALLBACK_ENABLED else '❌'}")
     log.info(f"DB: {STATE_DIR}/mexc-trades.sqlite3")
     log.info(f"TG: {'✅' if TG_ENABLED else '❌'} | API keys: {'✅' if API_KEY else '❌'}")
     if AUTO_MODE:
@@ -899,7 +960,8 @@ async def main():
 
     await asyncio.gather(
         binance_stream(),
-        mexc_poller(),
+        mexc_ws_stream(),
+        mexc_rest_fallback(),
         check_signals(),
         health_reporter(),
     )
